@@ -1,0 +1,334 @@
+# MLflow Tracking Server with OpenShift OAuth Proxy sidecar.
+#
+# Based on the oauth-mlflow pattern from:
+#   https://github.com/redhat-et/mlflow-openshift/tree/main/oauth-mlflow
+#
+# Adapted for this project:
+#   - Uses the existing in-cluster MinIO for S3 artifact storage
+#     instead of deploying a separate PostgreSQL + S3 backend.
+#   - Uses SQLite on a PVC for the metadata backend store.
+#   - Uses the quay.io/redhat-et/mlflow image from the upstream repo.
+#
+# Traffic flow:
+#   Browser ─► Route (TLS reencrypt) ─► oauth-proxy (:8443) ─► mlflow (:5000)
+#
+# Placeholders — replace these before applying:
+#
+#   <YOUR_NAMESPACE>    - target namespace (oc project -q)
+#   <OAUTH_PROXY_IMAGE> - oauth-proxy image for your cluster version:
+#                           oc adm release info $(oc get clusterversion version \
+#                             -o jsonpath='{.status.desired.image}') --image-for=oauth-proxy
+#   <ROUTE_HOSTNAME>    - the Route's hostname, available after first deploy:
+#                           oc get route mlflow -o jsonpath='{.spec.host}'
+#                         (deploy once, grab the hostname, update, redeploy)
+#
+# Prerequisites:
+#   1. The minio-credentials secret must already exist (see minio.yaml).
+#   2. Create the MLflow artifacts bucket in MinIO:
+#        oc port-forward svc/minio 9001:9001
+#        # then create a bucket named "mlflow" via the MinIO console
+#   3. Generate the cookie secret (do NOT use the YAML placeholder):
+#        oc create secret generic mlflow-proxy-cookie \
+#          --from-literal=session-secret=$(openssl rand -base64 32)
+#
+# Apply:
+#   oc apply -f infra/deploy/mlflow.yaml
+
+---
+# ServiceAccount for the OAuth proxy.
+#
+# The oauth-redirectreference annotation tells OpenShift which Route
+# to redirect back to after authentication.
+# (from upstream: oauth-mlflow/openshift/mlflow-sa.yaml)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mlflow
+  annotations:
+    serviceaccounts.openshift.io/oauth-redirectreference.primary: >-
+      {"kind":"OAuthRedirectReference","apiVersion":"v1",
+       "reference":{"kind":"Route","name":"mlflow"}}
+
+---
+# Role granting the mlflow SA permission to read Routes.
+# Required by the oauth-proxy --openshift-sar / --openshift-delegate-urls
+# checks so it can verify the caller has access to routes in this namespace.
+# (from upstream: oauth-mlflow/openshift/role-mlflow-sa-oauth-access.yaml)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mlflow-sa-oauth-access
+rules:
+  - verbs:
+      - get
+      - list
+    apiGroups:
+      - route.openshift.io
+    resources:
+      - routes
+
+---
+# Bind the Role to the mlflow ServiceAccount.
+# (from upstream: oauth-mlflow/openshift/mlflow-rbac-rolebinding.yaml)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mlflow-rbac-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mlflow-sa-oauth-access
+subjects:
+  - kind: ServiceAccount
+    name: mlflow
+
+---
+# ClusterRoleBinding allowing the oauth-proxy to perform
+# SubjectAccessReview / TokenReview calls against the API server.
+# (from upstream: oauth-mlflow/openshift/mlflow-server-oauth-access-rolebinding.yaml)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mlflow-server-oauth-access-<YOUR_NAMESPACE>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: mlflow
+    # IMPORTANT: set this to your target namespace.
+    # Find it with: oc project -q
+    namespace: <YOUR_NAMESPACE>
+
+---
+# Persistent storage for the MLflow SQLite metadata database.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mlflow-db
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# MLflow Tracking Server + OAuth Proxy sidecar.
+#
+# Two-container pod pattern from:
+#   oauth-mlflow/openshift/mlflow-server-deployment.yaml
+#
+# Adapted to:
+#   - Use quay.io/redhat-et/mlflow image
+#   - Add S3/MinIO artifact storage 
+#   - Add security contexts for OpenShift restricted SCC compliance
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow-server
+  labels:
+    app: mlflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: mlflow-server
+  strategy:
+    type: Recreate  # RWO PVC can only be mounted by one pod
+  template:
+    metadata:
+      labels:
+        name: mlflow-server
+        app: mlflow
+    spec:
+      serviceAccountName: mlflow
+      containers:
+        # ── OAuth Proxy sidecar ──────────────────────────────
+        # Authenticates users via OpenShift OAuth; only users who
+        # can log in to the cluster are allowed through.
+        # (from upstream: oauth-mlflow/openshift/mlflow-server-deployment.yaml)
+        - name: oauth-proxy
+          # Get the correct image for your cluster version with:
+          #   oc adm release info $(oc get clusterversion version \
+          #     -o jsonpath='{.status.desired.image}') --image-for=oauth-proxy
+          image: <OAUTH_PROXY_IMAGE>
+          args:
+            - --https-address=:8443
+            - --provider=openshift
+            - --openshift-service-account=mlflow
+            - --upstream=http://localhost:5000
+            - --tls-cert=/etc/tls/private/tls.crt
+            - --tls-key=/etc/tls/private/tls.key
+            - --cookie-secret-file=/etc/proxy/cookie/session-secret
+          ports:
+            - containerPort: 8443
+              name: https
+          livenessProbe:
+            httpGet:
+              path: /oauth/healthz
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 30
+            timeoutSeconds: 1
+            periodSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /oauth/healthz
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            timeoutSeconds: 1
+            periodSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "100m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: proxy-tls
+              mountPath: /etc/tls/private
+              readOnly: true
+            - name: cookie-secret
+              mountPath: /etc/proxy/cookie
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+        # ── MLflow tracking server ───────────────────────────
+        - name: mlflow
+          image: quay.io/redhat-et/mlflow:3.10.1
+          imagePullPolicy: IfNotPresent
+          command: ["mlflow"]
+          args:
+            - server
+            - --host=0.0.0.0
+            - --port=5000
+            # Set <ROUTE_HOSTNAME> to the Route's assigned hostname.
+            # Find it after initial deploy with: oc get route mlflow -o jsonpath='{.spec.host}'
+            - --allowed-hosts=localhost,mlflow-server,<ROUTE_HOSTNAME>
+            # SQLite backend store on persistent volume
+            - --backend-store-uri=sqlite:////tmp/mlflow-db/mlflow.db
+            # S3-compatible artifact store (MinIO)
+            - --default-artifact-root=s3://mlflow/artifacts
+            - --serve-artifacts
+          env:
+            # Point MLflow's boto/S3 client at the in-cluster MinIO
+            - name: MLFLOW_S3_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ENDPOINT_URL
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ROOT_USER
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ROOT_PASSWORD
+            - name: MLFLOW_S3_IGNORE_TLS
+              value: "true"
+          ports:
+            - containerPort: 5000
+              name: http
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30    # up to ~160s to start
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          volumeMounts:
+            - name: mlflow-db
+              mountPath: /tmp/mlflow-db
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+      securityContext:
+        runAsNonRoot: true
+
+      volumes:
+        - name: mlflow-db
+          persistentVolumeClaim:
+            claimName: mlflow-db
+        - name: proxy-tls
+          secret:
+            secretName: proxy-tls
+        - name: cookie-secret
+          secret:
+            secretName: mlflow-proxy-cookie
+
+---
+# Service for MLflow.
+#
+# The serving-cert annotation tells OpenShift to auto-generate TLS
+# certs and store them in the "proxy-tls" secret. The oauth-proxy
+# sidecar mounts this secret for its HTTPS listener.
+# (from upstream: oauth-mlflow/openshift/mlflow-server-service.yaml)
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-server
+  labels:
+    app: mlflow
+  annotations:
+    service.alpha.openshift.io/serving-cert-secret-name: proxy-tls
+spec:
+  selector:
+    name: mlflow-server
+  ports:
+    - name: mlflow-server
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+  type: ClusterIP
+
+---
+# TLS-reencrypt Route that sends traffic to the oauth-proxy port.
+# Users hit this URL in their browser and are redirected to the
+# OpenShift login page if not already authenticated.
+# (from upstream: oauth-mlflow/openshift/mlflow-server-service.yaml)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: mlflow
+  labels:
+    app: mlflow
+spec:
+  to:
+    kind: Service
+    name: mlflow-server
+  tls:
+    termination: Reencrypt
