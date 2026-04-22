@@ -10,12 +10,9 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-import ray
-
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_cpus=1)
 class InferenceWorker:
     """Generates predictions via vLLM for arbitrary evaluation tasks.
 
