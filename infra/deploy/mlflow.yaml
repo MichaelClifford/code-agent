@@ -215,7 +215,9 @@ spec:
             - --port=5000
             # Set <ROUTE_HOSTNAME> to the Route's assigned hostname.
             # Find it after initial deploy with: oc get route mlflow -o jsonpath='{.spec.host}'
-            - --allowed-hosts=localhost,mlflow-server,<ROUTE_HOSTNAME>
+            - --allowed-hosts=localhost,mlflow-server,mlflow-server:5000,<ROUTE_HOSTNAME>
+             # Allow the browser (via the Route) to make API calls to MLflow.
+            - --cors-allowed-origins=https://<ROUTE_HOSTNAME>
             # SQLite backend store on persistent volume
             - --backend-store-uri=sqlite:////tmp/mlflow-db/mlflow.db
             # S3-compatible artifact store (MinIO)
@@ -313,7 +315,49 @@ spec:
       port: 8443
       targetPort: 8443
       protocol: TCP
+    # Direct access to MLflow API for in-cluster clients (Ray workers, etc.)
+    # that don't go through OAuth. Only reachable within the cluster.
+    - name: mlflow-api
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
   type: ClusterIP
+
+---
+# NetworkPolicy restricting direct MLflow API access (port 5000).
+#
+# Port 5000 bypasses the OAuth proxy, so without this policy any pod
+# with cluster network access could hit the tracking server unauthenticated.
+# This policy limits port 5000 to pods labelled mlflow-client=true
+# (the Ray eval workers). Port 8443 (oauth-proxy) remains open to all
+# since it handles its own authentication.
+#
+# See: https://mlflow.org/docs/2.21.3/tracking/server
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mlflow-restrict-api
+  labels:
+    app: mlflow
+spec:
+  podSelector:
+    matchLabels:
+      name: mlflow-server
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow oauth-proxy port from anywhere (authenticated via OAuth)
+    - ports:
+        - port: 8443
+          protocol: TCP
+    # Allow direct MLflow API only from pods labelled mlflow-client=true
+    - from:
+        - podSelector:
+            matchLabels:
+              mlflow-client: "true"
+      ports:
+        - port: 5000
+          protocol: TCP
 
 ---
 # TLS-reencrypt Route that sends traffic to the oauth-proxy port.
@@ -330,5 +374,7 @@ spec:
   to:
     kind: Service
     name: mlflow-server
+  port:
+    targetPort: 8443
   tls:
     termination: Reencrypt
